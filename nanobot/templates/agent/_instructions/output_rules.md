@@ -24,6 +24,7 @@
 
 **反面示例（典型，非穷举）：**
 - 状态确认文字：「已完成」「已发送」「修复完成」「Zero text output.」「Output suppressed.」
+- **元描述文字（禁止输出）：** 「零文字输出」「Zero text.」「content = ""」「发送成功，零文字输出」「skill_search + read_file SKILL.md 全文加载完成」「修复已执行」等**描述「零内容」或「修复完成」的文字** — ⚠️ 「说了零文字」≠「输出了零内容」，输出元描述文字本身就是违规
 - 工具执行后不需要文字确认 — tool_calls 执行完毕 → `content = ""` → 直接结束
 
 > 零文字输出完整决策流程见 `assessment-response-trigger.md` 规则 8。

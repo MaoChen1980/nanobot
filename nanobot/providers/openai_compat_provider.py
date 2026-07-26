@@ -743,8 +743,6 @@ class OpenAICompatProvider(LLMProvider):
         status_code = getattr(e, "status_code", None)
         if status_code is None and response is not None:
             status_code = getattr(response, "status_code", None)
-        if status_code not in {400, 404, 422}:
-            return False
 
         body = (
             getattr(e, "body", None)
@@ -752,18 +750,43 @@ class OpenAICompatProvider(LLMProvider):
             or getattr(response, "text", None)
         )
         body_text = str(body).lower() if body is not None else ""
-        compatibility_markers = (
-            "responses",
-            "response api",
-            "max_output_tokens",
-            "instructions",
-            "previous_response",
-            "unsupported",
-            "not supported",
-            "unknown parameter",
-            "unrecognized request argument",
+
+        # 5xx server-side errors (overload, gateway timeout, etc.) are transient —
+        # fall back to /chat/completions which may succeed.
+        if status_code is not None and status_code >= 500:
+            return True
+
+        # For non-5xx errors, check transient markers in body (e.g. "overloaded").
+        # This catches cases like 529 overloaded_error where the status code alone
+        # doesn't indicate a known transient error.
+        transient_markers = (
+            "overloaded",
+            "rate limit",
+            "rate_limit",
+            "temporarily unavailable",
+            "速率限制",
         )
-        return any(marker in body_text for marker in compatibility_markers)
+        if any(marker in body_text for marker in transient_markers):
+            return True
+
+        # Only for 400/404/422 do we check for Responses API compatibility markers.
+        # These indicate the /responses endpoint doesn't support the request,
+        # but /chat/completions might.
+        if status_code in {400, 404, 422}:
+            compatibility_markers = (
+                "responses",
+                "response api",
+                "max_output_tokens",
+                "instructions",
+                "previous_response",
+                "unsupported",
+                "not supported",
+                "unknown parameter",
+                "unrecognized request argument",
+            )
+            return any(marker in body_text for marker in compatibility_markers)
+
+        return False
 
     def _build_responses_body(
         self,

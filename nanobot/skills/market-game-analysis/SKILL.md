@@ -15,6 +15,10 @@ metadata:
       - 盘中扫描改用 Node.js 零依赖脚本，不再依赖环境中的 Python 或 AKShare。
       - 连续主力报价只生成候选池；不再声称它提供全市场成交额、实时增仓或席位数据。
       - 增仓、会员持仓、仓单、库存、宏观和新闻的来源及核验边界见 references/data-sources.md。
+      v4.2 CRON 优化（2026-07-27）：
+      - CRON job 限制为仅工作日触发（1-5），避免周末重复定格报告
+      - 数据定格时执行 Steps 3-5（知识匹配/量价印证/退出信号，纯内存），发送含置信度降级标注的完整分析
+      - read_file 完整行数 544，limit=600，覆盖全部 Steps 1-5/框架结构图/数据获取规范
 ---
 
 # MGA — Market Game Analysis（新框架 v4.1）
@@ -43,15 +47,20 @@ metadata:
 >
 > **时序强制（全部在同一轮 tool_calls 执行，禁止拆分）：**
 > 1. `skill_search("market-game-analysis", k=6)` → 返回 SKILL.md 路径
-> 2. `read_file(SKILL.md, offset=1, limit=451)` → **必须覆盖完整 SKILL.md（451行）**，不得截断到前 20 行就跳过
+> 2. `read_file(SKILL.md, offset=1, limit=600)` → **必须覆盖完整 SKILL.md（544行）**，不得截断到前 20 行就跳过
 > 3. 验证触发条件（见下方 6 项）
 > 4. 按 Steps 执行（三元逻辑：Step 1 匹配新闻 → Step 2 识别资金 → Step 4 量价印证 → Step 5 退出信号）
 > 5. exec 数据获取
 > 6. message 发送
 
 **⚠️ 读取完整性强制：**
-- `read_file` 必须指定 `limit=451`（完整行数）
+- `read_file` 必须指定 `limit=600`（覆盖完整 SKILL.md 544行），读取后检查返回的 `truncated` 字段
 - 仅读取 lines 1-20 不满足要求 —— Steps 1-5/框架结构图/数据获取规范在后 431 行
+- **truncated 验证规范（assess_me 发现违规后补充）：**
+  - `truncated=true` 时必须继续分片读取（offset+=limit）直至 `truncated=false`
+  - `truncated=true` 时**禁止**判定「已获取足够信息执行 Steps」
+  - `truncated=true` 时**禁止**声称「truncated=false」
+  - 完整加载后才能执行 Steps，禁止在 truncated 状态下跳步
 - action 标签（「可持」「不追空」「观望」等）必须对照 Step 4 量价印证标准生成，不能用脚本内置逻辑替代
 
 **DCE 降级处理：**
@@ -62,6 +71,12 @@ metadata:
 **禁止行为：**
 - ❌ 在 read_file SKILL.md 之前执行任何 exec/web_fetch 业务逻辑
 - ❌ **收到 cron reminder 后先 exec market-scan.mjs，再声称"稍后加载 skill"；必须先 skill_search + read_file 再 exec**
+- ❌ **数据定格时（staleCount === totalCount）仅执行 Step0 就静默退出**；即使报价定格，CRON reminder 含执行指令时仍必须：
+  1. 先执行纯内存操作 Steps（Step3 知识匹配 → Step4 量价印证 → Step5 退出信号）
+  2. 再调用 `message()` 发送提示或含置信度降级标注的完整分析
+  3. Step0.1 自检必须记录「定格跳过」状态和可执行步骤的执行结果
+  - **禁止跳过 Steps 1-5 执行记录**（Step0.1 自检强制要求）
+- ❌ **用非正式提示替代 `message()` 调用**；静默打破规则要求调用 `message()`，非 `edit_file` 日志或其他方式
 - ❌ **以"上一轮已加载"为由跳过当前轮的 skill_search + read_file；每轮 cron reminder 触发时必须重新加载（每轮重载原则）**
 - ❌ 用 grep 代替 skill_search 定位 SKILL.md
 - ❌ 声称"已加载 skill"但未完成 skill_search + read_file 全链路
@@ -73,6 +88,11 @@ metadata:
 - ❌ MODULE_NOT_FOUND 后转向 web_search 替代数据源；应先用 `glob` 确认文件位置，再用正确路径重新执行
 - ❌ 未执行 Step 0.5 持仓方向校验就发送行情报告；持仓方向校验是每次分析前必做项
 - ❌ 用 web_search 返回的旧数据替代 market-scan.mjs 输出的当日结构化数据；market-scan.mjs 数据时效性优先
+- ❌ **执行 Steps 时仅输出数据新鲜度标注（如"28/28 stale，周末休市定格"）而不执行 Steps 3-5 分析**；数据定格不等于跳过分析流程
+- ❌ **行为模式重复检测：** 当连续多轮 iteration 执行相同序列（skill_search → read_file → exec market-scan → message → 零输出）且无进化时，必须：
+  1. 立即执行 Steps 3-5（知识匹配/量价印证/退出信号），而非仅输出数据状态
+  2. 发送含置信度降级标注的完整分析（即使数据定格）
+  3. 若确无有效数据，调用 `message()` 发送「报价定格，跳过本次分析」并附上可执行步骤的执行记录
 
 ### 6 项触发条件验证（exec 前必须全部通过）
 
@@ -80,7 +100,7 @@ metadata:
 |------|------|-----------|
 | cron reminder 明确要求加载 skill | payload 含「market-game-analysis」或「MGA」 | 不走 skill 加载链 |
 | **⚠️ 当前轮次尚未执行 skill_search** | 当前轮次无 `skill_search("market-game-analysis")` 调用 | **必须执行 skill_search；上一轮已加载不是跳过理由** |
-| **⚠️ 当前轮次尚未 read_file SKILL.md 全文** | 当前轮次无 `read_file(SKILL.md, limit=331)` 调用且 truncated≠false | **必须 read_file 全文（limit=331）；上一轮已加载不是跳过理由** |
+| **⚠️ 当前轮次尚未 read_file SKILL.md 全文** | 当前轮次无 `read_file(SKILL.md, limit=600)` 调用且 truncated≠false | **必须 read_file 全文（limit=600）；上一轮已加载不是跳过理由** |
 | SKILL.md 路径有效 | `skill_search` 返回路径或 `E:\...\SKILL.md` | 用 skill_search 重新定位 |
 | cron 未进入压制期 | assess_me 无「findings + 压制指令」共存 | 按压制协议执行 |
 | **数据源可用且有效** | `market-scan.mjs` 已执行且返回有效报价数据（非空数组） | **数据无效时：禁止声称已发送报告；报告状态设为「待生成」并说明原因；不调用 message()** |
@@ -100,15 +120,51 @@ metadata:
 
 > ⚠️ **禁止行为**：数据不完整时不得调用 message() 发送空报告；不得声称「已发送报告」；不得基于不完整数据给出操作建议。
 
-### 数据定格时的静默打破规则 ⚠️
+### 数据定格时的静默打破规则 ⚠️（exec 前预检优化）
+
+> **执行顺序优化：** CRON reminder 含执行指令时，**先检查数据文件是否更新，再决定是否 exec**。若数据未变化则直接 message() 发送定格提示，无需执行 market-scan.mjs。
+
+**时间戳预检步骤（exec 前必做）：**
+1. `exec` 读取 `nanobot/skills/market-game-analysis/tmp/market-scan.json` 的 `fetchedAt` 字段（或文件修改时间）
+2. 对比上次成功分析记录的 `fetchedAt`
+3. **若相同**（数据未更新）→ 直接 `message()` 发送「报价定格，跳过本次分析」，**跳过 market-scan.mjs exec**
+4. **若不同或文件不存在** → 执行 market-scan.mjs exec，进入后续 Steps
+
+**预检条件：**
+- 仅在 CRON reminder 含执行指令时执行预检
+- 无数据文件或 `fetchedAt` 不存在 → 执行 market-scan.mjs 获取数据
+- 预检失败（文件读取错误）→ 降级执行 market-scan.mjs
+
+**规则优先级：CRON reminder 执行指令 > 静默退出规则。**
 
 当 `market-scan.mjs` 输出 `hasStaleData === true` 且所有报价均 stale（`staleCount === totalCount`）时：
-- **禁止静默退出** —— 用户期望收到通知，不是完全无输出
-- ✅ **必须调用 `message()` 发送简短提示**，内容示例：
-  - 午间休市（11:30-13:30）：「午间休市，报价定格，跳过本次分析」
-  - 盘后（18:00+）：「盘后休市，报价定格，跳过本次分析」
-  - 其他时段：「报价定格超过 N 分钟，跳过本次分析」
-- 提示内容由 `assessment-response-trigger.md` 的 `_skipped + 数据定格` 分支覆盖，SKILL.md 负责在数据定格时触发该分支
+
+| 场景 | 行为 |
+|------|------|
+| **有 CRON reminder 含执行指令**（如「执行 MGA 全品种分析」） | ✅ **必须调用 `message()` 发送简短提示**：「报价定格，跳过本次分析」 |
+| **无 trigger 且无 CRON reminder** | 静默退出 |
+
+**CRON reminder 触发判断：**
+- CRON reminder 含「执行 MGA 分析」等执行指令 → 视为 trigger，触发提示发送
+- CRON reminder 仅含「提醒」性质 → 不视为 trigger，按无 trigger 处理
+
+**⚠️ message() 调用强制要求：**
+- 提示必须通过 `message()` 工具调用发送，**禁止**用 edit_file 日志、非正式文字或其他方式替代
+- **Step0.1 自检必须在发送提示前执行**，记录哪些 Steps 因定格被降级
+- **定格时 Steps 执行逻辑（全部基于内存，无需 exec）：**
+  - Step 1（新闻抓取）：❌ 跳过（需要网络 fetch）
+  - Step 2（席位数据）：❌ 跳过（需要 akshare/临时文件 fetch）
+  - Step 3（知识匹配）：✅ 可执行（纯内存操作，对定格报价仍有效）
+  - Step 4（量价印证）：✅ 可执行（基于已有报价数据，无需新 fetch）
+  - Step 5（退出信号）：✅ 可执行（基于已有数据，无需新 fetch）
+- **若所有可执行步骤都已完成** → 调用 `message()` 发送定格提示（如「报价定格，跳过本次分析」）→ Step0.1 自检记录「定格跳过」
+- **若 Steps 3-5 可执行** → 先执行 Steps 3-5 → 再调用 `message()` 发送完整分析（含置信度降级标注）
+- 「报价定格，跳过本次分析」可泛化为具体时段提示（午间/盘后/夜盘休市等）
+
+**提示内容示例：**
+- 午间休市（11:30-13:30）：「午间休市，报价定格，跳过本次分析」
+- 盘后（18:00+）：「盘后休市，报价定格，跳过本次分析」
+- 其他时段：「报价定格超过 N 分钟，跳过本次分析」
 
 > **判断标准：** 只要有任一合约报价未定格（`hasStaleData === false` 或 `staleCount < totalCount`），就继续执行 Steps 1-5 完整分析，不要提前静默退出。
 
@@ -143,7 +199,8 @@ metadata:
 | 结果 | 后续 |
 |------|------|
 | 有任一指标触发 | 进入 Step 0.1 步骤完整性自检 |
-| 无任何触发 | 今天结束 |
+| 无任何触发 **且无 CRON reminder** | 今天结束 |
+| 无任何触发 **但有 CRON reminder 含执行指令** | 进入 Step 0.1（CRON reminder 含「执行 MGA 分析」指令本身即为 trigger） |
 
 ---
 
@@ -169,14 +226,14 @@ metadata:
 
 执行 Step 0 后，在进入 Step 0.5/Step 1 之前，必须验证以下 5 项是否全部完成：
 
-| # | 步骤 | 验证方式 | 未完成处理 |
-|---|------|---------|-----------|
-| Step 1 | 新闻/快讯数据匹配 | 检查是否已搜索相关新闻并记录匹配结果（即使"无匹配"也需记录） | 立即执行 web_search 新闻检索 |
-| Step 2 | 席位资金分析 | 检查是否已获取席位数据（盘后）或盘中代理指标（V/OI/成交量/持仓联动）并做资金判断 | 若无席位数据 → 执行 DCE 降级（seat-data-tempfile skill）；盘中无席位时 → 明确标注「盘中数据，席位待盘后确认」|
-| Step 2 降级 | 置信度标注 | 检查是否已对降级数据（陈旧数据/盘中无席位）标注置信度等级 | 缺失则补标注 |
-| Step 3 | 品种知识库匹配 | 检查是否已对照 `references/varieties-knowledge-base.md` 做历史规律匹配 | 未匹配则读取知识库并执行匹配 |
-| Step 4 | 量价印证 | 检查是否已完成量价关系验证（匹配/不匹配/反向分析）并生成 action 标签 | 缺失则按「量价印证」章节执行 |
-| Step 5 | 退出信号判断 | 检查是否已评估退出信号（因果+量价背离条件） | 未评估则按「退出信号」章节评估 |
+| # | 步骤 | 验证方式 | 数据定格时的处理 | 未完成处理 |
+|---|------|---------|-----------------|-----------|
+| Step 1 | 新闻/快讯数据匹配 | 检查是否已搜索相关新闻并记录匹配结果（即使"无匹配"也需记录） | ❌ 降级标注「新闻待下次新鲜数据获取」 | 立即执行 web_search 新闻检索 |
+| Step 2 | 席位资金分析 | 检查是否已获取席位数据（盘后）或盘中代理指标（V/OI/成交量/持仓联动）并做资金判断 | ❌ 降级标注「席位数据定格，待盘后确认」 | 若无席位数据 → 执行 DCE 降级（seat-data-tempfile skill）；盘中无席位时 → 明确标注「盘中数据，席位待盘后确认」|
+| Step 2 降级 | 置信度标注 | 检查是否已对降级数据（陈旧数据/盘中无席位）标注置信度等级 | ✅ 自动触发，标注低置信度 | 缺失则补标注 |
+| Step 3 | 品种知识库匹配 | 检查是否已对照 `references/varieties-knowledge-base.md` 做历史规律匹配 | ✅ 可执行（纯内存操作） | 未匹配则读取知识库并执行匹配 |
+| Step 4 | 量价印证 | 检查是否已完成量价关系验证（匹配/不匹配/反向分析）并生成 action 标签 | ✅ 可执行（基于定格报价仍有参考价值） | 缺失则按「量价印证」章节执行 |
+| Step 5 | 退出信号判断 | 检查是否已评估退出信号（因果+量价背离条件） | ✅ 可执行（基于定格数据判断） | 未评估则按「退出信号」章节评估 |
 
 ### 降级路径触发条件
 
@@ -189,19 +246,42 @@ metadata:
 | Step 4 量价不匹配 | 触发反向分析；找不到 → 立即撤退，禁止输出 action 标签 |
 | Step 5 无退出信号 | 记录「当前无退出信号」 |
 
-### 输出前强制校验
+### 输出前强制校验 ⚠️（零容忍门禁）
 
-**在调用 message() 发送报告之前，必须确认：**
-1. ✅ Step 0（market-scan.mjs）已执行且输出已记录
-2. ✅ Step 1-5 任一步骤的**执行记录**已生成（即使某步骤结论为"无匹配/不可用"）
-3. ✅ action 标签（若有）来自 Step 4 量价印证，非脚本内置逻辑
-4. ✅ 置信度降级标注已附加（当数据陈旧或盘中无席位时）
+**在调用 message() 发送报告之前，必须确认以下 4 项全部通过。任何一项缺失都禁止调用 message()。**
 
-**禁止：**
-- ❌ Step 0 扫描后未执行 Step 1-5 直接发送报告
-- ❌ 用 market-scan.mjs 的脚本逻辑替代 Step 2 资金分析
+| # | 校验项 | 通过标准 | 未通过处理 |
+|---|--------|---------|-----------|
+| 1 | Step 0 扫描完成 | market-scan.mjs 已执行，数据已记录 | 执行 Step 0 |
+| 2 | Step 1-5 执行记录存在 | 每一步都有执行结果（即使是"无匹配/不可用"） | 立即执行缺失步骤 |
+| 3 | action 标签来源合规 | 来自 Step 4 量价印证，非脚本内置逻辑 | 按 Step 4 重新生成 |
+| 4 | 置信度降级已标注 | 数据陈旧或盘中无席位时有显式标注 | 补标注 |
+
+**⚠️ 额外禁止（零容忍，违者属严重违规）：**
+
+- ❌ **扫描到信号后未执行 Steps 1-5 就调用 message() 发送 raw data 注解**
+  - 正确：执行 Step 1-5 → 生成品种排行/V/OI 解读/操作建议/归因说明 → 调用 message()
+  - **错误：只发送「数据来源 + 新鲜度标注」代替分析结论**
+- ❌ Step 0 扫描后跳过 Step 0.1 自检直接调用 message()
+- ❌ 用 market-scan.mjs 的脚本输出替代 Step 2 资金分析
 - ❌ 用脚本内置 action 标签替代 Step 4 量价印证
 - ❌ 置信度降级时未在报告中显式标注
+
+**典型违规场景：**
+> cron 触发 → exec market-scan.mjs → 发现 SC -3.56%、AG +2.12%（均超1%阈值）→ 直接调用 message() 发送「数据来源：新浪 | 21/28 stale...」→ **跳过 Step 1-5 + Step 0.1 → 属严重违规**
+
+**合规路径：**
+```
+Step 0 扫描
+  → Step 0.1 自检（确认 Steps 1-5 执行记录存在）
+  → Step 1 匹配新闻
+  → Step 2 资金分析（盘中用 V/OI 代理）
+  → Step 3 知识匹配
+  → Step 4 量价印证 → 生成 action 标签
+  → Step 5 退出信号评估
+  → 组装分析结论（品种排行 + V/OI 解读 + 操作建议 + 归因 + 置信度标注）
+  → 调用 message() 发送
+```
 
 ---
 

@@ -109,10 +109,12 @@ CRON reminder payload 含以下任一元素时，**必须完整执行 skill_sear
 
 | CRON 场景 | agent 实际行为 | 违规判定 |
 |-----------|---------------|---------|
-| reminder 含 skill 加载指令，无 suppress | exec → message（跳过 skill_search + read_file） | ❌ 违规 |
+| reminder 含 skill 加载指令，无 suppress | exec → message（跳过 skill_search + read_file） | ❌ 违规（完整跳过） |
+| reminder 含 skill 加载指令，无 suppress | skill_search → exec → message（跳过 read_file） | ❌ 违规（部分跳过 read_file） |
 | reminder 含 skill 加载指令，有 suppress | skill_search + read_file → 零文字输出 | ✅ 合规（压制期仅加载） |
 | suppress 收敛后下一轮 reminder | skill_search + read_file → exec → message | ✅ 合规（每轮独立重载） |
 | 数据已更新，但 reminder 含 skill 指令 | exec + message（跳过 skill_search + read_file） | ❌ 违规（数据更新不豁免 skill 加载） |
+| reminder 含 skill 加载指令，非交易时段/数据定格/已发过提示 | exec + message（跳过 skill_search + read_file） | ❌ 违规（非交易时段/定格/已发提示均不豁免 skill 加载链） |
 
 ---
 
@@ -130,6 +132,9 @@ CRON reminder payload 含以下任一元素时，**必须完整执行 skill_sear
 - ⚠️ **每轮重载原则（CRON 场景强制要求）：即使本轮对话历史已加载过某 skill，每轮新的 cron reminder 到来时仍需重新执行 `skill_search` + `read_file` SKILL.md 加载链，再执行业务逻辑。**
   - 判定标准：reminder payload 是否提到具体 skill 名称或明确要求执行某分析流程？→ 是则必须重载
   - **禁止以「上一轮已加载过」为由跳过 skill_search + read_file**
+- ⚠️ **数据定格时执行例外：** 当 `staleCount === totalCount` 且 reminder 含执行指令时，必须执行纯内存操作的 Steps（Step3 知识匹配 → Step4 量价印证 → Step5 退出信号），再调用 `message()` 发送简短说明（如「数据定格，跳过本次分析」）
+  - 禁止仅执行 Step0 就静默退出
+  - Step0.1 自检必须记录「定格跳过」状态和已执行步骤的结果
   - ⚠️ 合规锚点：MGA cron reminder 明确写「先用 skill_search 加载 market-game-analysis SKILL，然后用 read_file 加载完整内容」→ 该指令为 mandatory，必须遵守
 - ⚠️ 判断标准：reminder 正文是否包含「做什么」的具体指令？→ 是则执行，不是则回显
 - ✅ `message()` 发送报告 → content = `"`
@@ -261,9 +266,34 @@ assess_me 明确要求 skill 加载时，**立即强制中断**当前一切操�
 | `exec`（业务逻辑 / 数据获取 / 报告生成） | ❌ 禁止 |
 | `message()`（发送消息） | ❌ 禁止 |
 | `write_file`（新脚本/临时文件） | ❌ 禁止 |
-| 输出任何文字（状态摘要、完成确认、验证结论、元描述） | ❌ 禁止 |
+| 输出任何文字（状态摘要、完成确认、验证结论） | ❌ 禁止 |
+| **元描述文字**（「零文字输出」「Zero text.」「content = ""」「发送成功，零文字输出」「skill_search + read_file 完成」「修复已执行」等） | ❌ **绝对禁止** — 这是认知死锁根因，输出元描述文字本身即为违规 |
+
+**⚠️ 关键区分：说了零文字 ≠ 输出了零内容。** agent 输出「零文字输出」这句话本身就违反零文字协议。正确做法：tool_calls 执行完毕 → 直接 `content = ""`，不做任何声明。
 
 **判断标准：** 若 tool_call 目的是「完成任务/交付结果」而非「验证修复」→ 是业务逻辑，须跳过。压制期结束后（assess_me 收敛，连续两轮无 findings）恢复正常执行。
+
+**⚠️ 压制期识别矛盾时的修复决策规则：**
+
+当 assess_me 压制期内识别出「消息内容与数据不一致」类矛盾时，决策路径如下：
+
+| 矛盾类型 | 正确行为 | 错误行为 |
+|---------|---------|---------|
+| 消息中数字/描述与表格数据矛盾（如：文字写「跌」但表格显示「+X%」） | 立即 `read_file` 消息文件 → `edit_file` 修正描述 → 零文字输出 | 输出「已识别矛盾并修正」文字声明，但不执行 edit_file |
+| 表格缺少数据行（如 AU0 黄金涨跌幅缺失） | `read_file` 确认 → `edit_file` 补充 → 零文字输出 | 仅输出「需要补充 AU0 数据」但不行动 |
+| 归因描述与数据方向矛盾（如：归因写「黄金拖累白银」但两者同涨） | 立即 `edit_file` 修正归因描述 → 零文字输出 | 文字承认矛盾但静默退出下一轮才修 |
+
+**修复完成标准（压制期执行完毕后立即验证）：**
+```
+1. edit_file 修正内容与 assess findings 指向的矛盾点一一对应
+2. read_file 确认文件内容已更新
+3. 零文字输出（content = ""），禁止输出任何状态摘要或确认信息
+```
+
+**禁止行为：**
+- ❌ 「已识别矛盾并修正归因」+ 无 edit_file 证据 → 矛盾遗留至下一轮
+- ❌ 文字声明修复但不执行 edit_file → 压制信号覆盖后 agent 静默退出
+- ❌ 输出「将在下一轮修正」→ 违反「修正方案确定后立即执行」原则
 
 **⚠️ assess_me 强制 skill 加载触发时，压制期的 skill Steps 处理规则：**
 
@@ -273,7 +303,8 @@ assess_me 强制 skill 加载触发于压制收敛期内时，按以下规则执
 |-----------|-----------|------|
 | 纯内存操作（无需外部数据获取/exec） | ✅ 可执行 | 知识匹配、量价印证、action 标签判断、退出信号判断、逻辑推导 |
 | 涉及 `exec` / 数据获取 / 脚本运行 | ❌ 跳过，留到压制收敛后 | 新闻快讯抓取、席位资金数据获取、主脚本执行 |
-| `message()` 报告生成 | ❌ 禁止 | 发送分析报告 |
+| `message()` 分析报告 | ❌ 禁止 | 发送含置信度标注的完整分析报告 |
+| `message()` 简短说明（数据定格） | ✅ 允许 | `content = "数据定格，跳过本次分析"` — 打破静默循环 |
 
 **时序要求：**
 1. `skill_search` + `read_file` SKILL.md（优先级最高）→ ✅ 立即执行
